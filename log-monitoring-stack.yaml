@@ -1,0 +1,433 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Real-Time Log Monitoring Pipeline - CloudWatch Logs, Lambda, DynamoDB, SNS, and Dashboard'
+
+Parameters:
+  AlertEmail:
+    Type: String
+    Description: Email address to receive alarm notifications
+    Default: how.britton@gmail.com
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: Must be a valid email address
+
+  ErrorThreshold:
+    Type: Number
+    Description: Number of errors to trigger alarm
+    Default: 3
+    MinValue: 1
+    MaxValue: 100
+
+  EvaluationPeriods:
+    Type: Number
+    Description: Number of periods to evaluate
+    Default: 1
+    MinValue: 1
+    MaxValue: 5
+
+  ProjectName:
+    Type: String
+    Description: Project name for resource tagging
+    Default: RealTimeLogMonitoring
+
+Resources:
+  # ============================================
+  # DynamoDB Table for Log Incidents
+  # ============================================
+  LogIncidentsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-LogIncidents'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: incidentId
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: N
+      KeySchema:
+        - AttributeName: incidentId
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: Development
+
+  # ============================================
+  # SNS Topic for Alarms
+  # ============================================
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-Alerts'
+      DisplayName: Log Monitoring Alert System
+      Subscription:
+        - Endpoint: !Ref AlertEmail
+          Protocol: email
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  AlertTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref AlertTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudWatchAlarms
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action:
+              - sns:Publish
+            Resource: !Ref AlertTopic
+
+  # ============================================
+  # CloudWatch Log Group
+  # ============================================
+  ApplicationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/application/demo-app
+      RetentionInDays: 7
+
+  # ============================================
+  # Metric Filter for ERROR logs
+  # ============================================
+  ErrorMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      FilterPattern: '[time, request_id, level = ERROR*, msg]'
+      LogGroupName: !Ref ApplicationLogGroup
+      MetricTransformations:
+        - MetricName: ErrorCount
+          MetricNamespace: CustomApp/Logs
+          MetricValue: '1'
+          DefaultValue: 0
+          Unit: Count
+
+  # ============================================
+  # Lambda Execution Role
+  # ============================================
+  LogProcessorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-LambdaRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: LogProcessorPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:GetItem
+                Resource: !GetAtt LogIncidentsTable.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*'
+
+  # ============================================
+  # Lambda Function - Log Processor
+  # ============================================
+  LogProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-LogProcessor'
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt LogProcessorRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          INCIDENTS_TABLE: !Ref LogIncidentsTable
+      Code:
+        ZipFile: |
+          const { DynamoDBClient } = require("@aws-sdk/client-dynamodb");
+          const { PutItemCommand, DynamoDBDocumentClient } = require("@aws-sdk/lib-dynamodb");
+          const crypto = require('crypto');
+
+          const client = new DynamoDBClient({});
+          const docClient = DynamoDBDocumentClient.from(client);
+
+          exports.handler = async (event) => {
+              console.log('Received event:', JSON.stringify(event, null, 2));
+              
+              try {
+                  // Parse SNS message from CloudWatch Alarm
+                  const snsMessage = JSON.parse(event.Records[0].Sns.Message);
+                  
+                  const incidentId = crypto.randomUUID();
+                  const timestamp = Date.now();
+                  
+                  const incident = {
+                      incidentId: incidentId,
+                      timestamp: timestamp,
+                      alarmName: snsMessage.AlarmName,
+                      alarmDescription: snsMessage.AlarmDescription || 'No description',
+                      newStateValue: snsMessage.NewStateValue,
+                      newStateReason: snsMessage.NewStateReason,
+                      stateChangeTime: snsMessage.StateChangeTime,
+                      region: snsMessage.Region,
+                      metricName: snsMessage.Trigger?.MetricName || 'Unknown',
+                      namespace: snsMessage.Trigger?.Namespace || 'Unknown',
+                      threshold: snsMessage.Trigger?.Threshold || 0,
+                      evaluationPeriods: snsMessage.Trigger?.EvaluationPeriods || 1,
+                      datapointsToAlarm: snsMessage.Trigger?.DatapointsToAlarm || 1,
+                      createdAt: new Date().toISOString()
+                  };
+                  
+                  const command = new PutItemCommand({
+                      TableName: process.env.INCIDENTS_TABLE,
+                      Item: incident
+                  });
+                  
+                  await docClient.send(command);
+                  
+                  console.log('Successfully stored incident:', incidentId);
+                  
+                  return {
+                      statusCode: 200,
+                      body: JSON.stringify({
+                          message: 'Incident logged successfully',
+                          incidentId: incidentId
+                      })
+                  };
+              } catch (error) {
+                  console.error('Error processing alarm:', error);
+                  throw error;
+              }
+          };
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ============================================
+  # Lambda Permission for CloudWatch Alarms
+  # ============================================
+  LogProcessorInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LogProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: lambda.alarms.cloudwatch.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+
+  # Lambda Permission for SNS
+  LogProcessorSNSPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LogProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref AlertTopic
+
+  # SNS Subscription for Lambda
+  LambdaSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: lambda
+      TopicArn: !Ref AlertTopic
+      Endpoint: !GetAtt LogProcessorFunction.Arn
+
+  # ============================================
+  # CloudWatch Alarm
+  # ============================================
+  ErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-ErrorAlarm'
+      AlarmDescription: Triggers when application errors exceed threshold
+      MetricName: ErrorCount
+      Namespace: CustomApp/Logs
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: !Ref EvaluationPeriods
+      Threshold: !Ref ErrorThreshold
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref AlertTopic
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ============================================
+  # CloudWatch Dashboard
+  # ============================================
+  MonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-Dashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "properties": {
+                "metrics": [
+                  ["CustomApp/Logs", "ErrorCount", {"stat": "Sum", "label": "Total Errors"}]
+                ],
+                "period": 60,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Error Count Over Time",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", {"stat": "Sum", "label": "Lambda Invocations"}],
+                  [".", "Errors", {"stat": "Sum", "label": "Lambda Errors"}],
+                  [".", "Duration", {"stat": "Average", "label": "Avg Duration (ms)"}]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Lambda Metrics",
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                }
+              }
+            },
+            {
+              "type": "log",
+              "properties": {
+                "query": "SOURCE '/aws/application/demo-app'\n| fields @timestamp, @message\n| filter @message like /ERROR/\n| sort @timestamp desc\n| limit 20",
+                "region": "${AWS::Region}",
+                "title": "Recent Error Logs",
+                "stacked": false
+              }
+            },
+            {
+              "type": "metric",
+              "properties": {
+                "metrics": [
+                  ["AWS/DynamoDB", "ConsumedWriteCapacityUnits", {"stat": "Sum"}]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "DynamoDB Write Activity"
+              }
+            }
+          ]
+        }
+
+  # ============================================
+  # (Optional) S3 Bucket for Log Archive
+  # ============================================
+  LogArchiveBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-logs-${AWS::AccountId}'
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToGlacier
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: GLACIER
+            ExpirationInDays: 365
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ============================================
+  # (Optional) Kinesis Firehose for S3 Delivery
+  # ============================================
+  FirehoseDeliveryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FirehoseS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt LogArchiveBucket.Arn
+                  - !Sub '${LogArchiveBucket.Arn}/*'
+
+Outputs:
+  DynamoDBTableName:
+    Description: Name of the DynamoDB table storing incidents
+    Value: !Ref LogIncidentsTable
+    Export:
+      Name: !Sub '${ProjectName}-IncidentsTable'
+
+  SNSTopicArn:
+    Description: ARN of the SNS topic for alerts
+    Value: !Ref AlertTopic
+    Export:
+      Name: !Sub '${ProjectName}-AlertTopic'
+
+  LambdaFunctionArn:
+    Description: ARN of the Lambda log processor function
+    Value: !GetAtt LogProcessorFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-LambdaFunction'
+
+  LogGroupName:
+    Description: Name of the CloudWatch Log Group
+    Value: !Ref ApplicationLogGroup
+    Export:
+      Name: !Sub '${ProjectName}-LogGroup'
+
+  DashboardURL:
+    Description: URL to the CloudWatch Dashboard
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-Dashboard'
+
+  AlarmName:
+    Description: Name of the CloudWatch Alarm
+    Value: !Ref ErrorAlarm
+
+  S3BucketName:
+    Description: Name of the S3 bucket for log archives
+    Value: !Ref LogArchiveBucket
+    Export:
+      Name: !Sub '${ProjectName}-ArchiveBucket'
